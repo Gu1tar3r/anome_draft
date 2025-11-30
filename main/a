@@ -1,0 +1,632 @@
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
+from pathlib import Path
+import os
+import secrets
+import json
+import time
+from typing import Optional, Dict
+from passlib.hash import bcrypt
+import jwt
+from typing import Tuple
+import io
+import re
+import zipfile
+from urllib import request as urlrequest
+
+# 导入存储适配器
+try:
+    from storage_adapter import (
+        _ensure_storage_ready,
+        _presign_get_url,
+        _presign_put_url,
+        _storage_download,
+        _storage_upload,
+    )
+except ImportError:
+    # 如果导入失败，提供基础实现
+    from fastapi import HTTPException as StorageHTTPException
+    
+    def _ensure_storage_ready():
+        raise StorageHTTPException(status_code=501, detail="存储适配器未正确配置")
+    
+    def _presign_get_url(key: str) -> str:
+        raise StorageHTTPException(status_code=501, detail="存储适配器未正确配置")
+    
+    def _presign_put_url(key: str, content_type: str) -> Tuple[str, dict]:
+        raise StorageHTTPException(status_code=501, detail="存储适配器未正确配置")
+    
+    def _storage_download(key: str) -> bytes:
+        raise StorageHTTPException(status_code=501, detail="存储适配器未正确配置")
+    
+    def _storage_upload(key: str, data: bytes, content_type: str = "application/octet-stream"):
+        raise StorageHTTPException(status_code=501, detail="存储适配器未正确配置")
+
+# 导入AI模块
+try:
+    from ai.reading_ai import ReadingAI
+    from ai.routes import router as ai_router
+except ImportError:
+    # 如果AI模块不可用，创建空路由
+    from fastapi import APIRouter
+    ai_router = APIRouter()
+    
+    class ReadingAI:
+        def __init__(self, storage):
+            self.storage = storage
+
+app = FastAPI()
+storage = ReadingAI  # 临时占位，实际使用时需要替换
+
+# 环境变量加载
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# 基础配置
+ALGORITHM = "HS256"
+BASE_DIR = Path(__file__).resolve().parent
+
+# 环境变量配置
+SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-key-change-this")
+ACCESS_TOKEN_EXPIRE_SECONDS = int(os.environ.get("ACCESS_TOKEN_EXPIRE_SECONDS", str(60 * 60 * 24)))
+REFRESH_TOKEN_EXPIRE_SECONDS = int(os.environ.get("REFRESH_TOKEN_EXPIRE_SECONDS", str(60 * 60 * 24 * 30)))
+
+# 数据目录配置
+DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR / "data")))
+USERS_FILE = DATA_DIR / "users.json"
+CODES_FILE = DATA_DIR / "codes.json"
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+if not USERS_FILE.exists():
+    USERS_FILE.write_text(json.dumps({}, ensure_ascii=False))
+if not CODES_FILE.exists():
+    CODES_FILE.write_text(json.dumps({}, ensure_ascii=False))
+
+def load_users() -> Dict[str, dict]:
+    try:
+        return json.loads(USERS_FILE.read_text())
+    except Exception:
+        return {}
+
+def save_users(users: Dict[str, dict]):
+    USERS_FILE.write_text(json.dumps(users, ensure_ascii=False, indent=2))
+
+def load_codes() -> Dict[str, dict]:
+    try:
+        return json.loads(CODES_FILE.read_text())
+    except Exception:
+        return {}
+
+def save_codes(codes: Dict[str, dict]):
+    CODES_FILE.write_text(json.dumps(codes, ensure_ascii=False, indent=2))
+
+def create_access_token(sub: str) -> str:
+    payload = {
+        "type": "access",
+        "sub": sub,
+        "iat": int(time.time()),
+        "exp": int(time.time()) + ACCESS_TOKEN_EXPIRE_SECONDS,
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+def create_refresh_token(sub: str) -> str:
+    payload = {
+        "type": "refresh",
+        "sub": sub,
+        "jti": secrets.token_hex(16),
+        "iat": int(time.time()),
+        "exp": int(time.time()) + REFRESH_TOKEN_EXPIRE_SECONDS,
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+def _decode_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token 已过期")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Token 无效")
+
+def decode_access_token(token: str) -> dict:
+    payload = _decode_token(token)
+    if payload.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Token 类型错误")
+    return payload
+
+def decode_refresh_token(token: str) -> dict:
+    payload = _decode_token(token)
+    if payload.get("type") != "refresh":
+        raise HTTPException(status_code=401, detail="Token 类型错误")
+    return payload
+
+class RegisterBody(BaseModel):
+    email: EmailStr
+    password: str
+    name: Optional[str] = None
+    code: str
+
+class LoginBody(BaseModel):
+    email: EmailStr
+    password: str
+
+class LoginCodeBody(BaseModel):
+    email: EmailStr
+    code: str
+
+class PresignPutBody(BaseModel):
+    key: str
+    contentType: Optional[str] = None
+
+class AIIngestBody(BaseModel):
+    bookId: str
+    fileType: str
+
+class AIQueryBody(BaseModel):
+    bookId: str
+    question: str
+    position: Optional[int] = None
+    companionMode: Optional[bool] = False
+
+# CORS配置
+cors_env = os.environ.get("CORS_ORIGINS", "")
+if cors_env.strip():
+    origins = [o.strip() for o in cors_env.split(",") if o.strip()]
+else:
+    origins = [
+        "http://localhost:55119",
+        "http://127.0.0.1:55119",
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+    ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 存储后端配置
+STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "none").lower()
+STORAGE_ENDPOINT = os.environ.get("STORAGE_ENDPOINT", "")
+STORAGE_BUCKET = os.environ.get("STORAGE_BUCKET", "")
+STORAGE_ACCESS_KEY = os.environ.get("STORAGE_ACCESS_KEY", "")
+STORAGE_SECRET_KEY = os.environ.get("STORAGE_SECRET_KEY", "")
+STORAGE_REGION = os.environ.get("STORAGE_REGION", "")
+STORAGE_SECURE = os.environ.get("STORAGE_SECURE", "true").lower() in {"1", "true", "yes"}
+STORAGE_URL_EXPIRES = int(os.environ.get("STORAGE_URL_EXPIRES", "600"))
+
+# AI配置
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "zhipu").lower()
+GLM_API_KEY = os.environ.get("GLM_API_KEY", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+LLM_MODEL_FAST = os.environ.get(
+    "LLM_MODEL_FAST",
+    "gpt-4o-mini" if LLM_PROVIDER == "openai" else "glm-4-flash",
+)
+LLM_MODEL_PRO = os.environ.get(
+    "LLM_MODEL_PRO",
+    "gpt-4o" if LLM_PROVIDER == "openai" else "glm-4-air",
+)
+LLM_MAX_INPUT_TOKENS = int(os.environ.get("LLM_MAX_INPUT_TOKENS", "1200"))
+LLM_MAX_OUTPUT_TOKENS = int(os.environ.get("LLM_MAX_OUTPUT_TOKENS", "600"))
+
+def _extract_text(file_bytes: bytes, file_type: str) -> str:
+    ft = file_type.lower()
+    if ft in {"txt", "md"}:
+        for enc in ("utf-8", "gb18030", "latin-1"):
+            try:
+                return file_bytes.decode(enc)
+            except Exception:
+                pass
+        return file_bytes.decode("utf-8", errors="ignore")
+    if ft in {"html", "htm"}:
+        txt = file_bytes.decode("utf-8", errors="ignore")
+        txt = re.sub(r"<script[\s\S]*?</script>", " ", txt, flags=re.IGNORECASE)
+        txt = re.sub(r"<style[\s\S]*?</style>", " ", txt, flags=re.IGNORECASE)
+        txt = re.sub(r"<[^>]+>", " ", txt)
+        txt = re.sub(r"\s+", " ", txt)
+        return txt.strip()
+    if ft == "epub":
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(file_bytes))
+            texts = []
+            for name in zf.namelist():
+                if name.lower().endswith((".xhtml", ".html", ".htm")):
+                    try:
+                        raw = zf.read(name).decode("utf-8", errors="ignore")
+                        clean = re.sub(r"<script[\s\S]*?</script>", " ", raw, flags=re.IGNORECASE)
+                        clean = re.sub(r"<style[\s\S]*?</style>", " ", clean, flags=re.IGNORECASE)
+                        clean = re.sub(r"<[^>]+>", " ", clean)
+                        clean = re.sub(r"\s+", " ", clean)
+                        texts.append(clean.strip())
+                    except Exception:
+                        pass
+            return "\n".join(texts)
+        except Exception:
+            return ""
+    return ""
+
+def _chunk_text(text: str, max_chars: int = 2000, overlap: int = 200) -> list:
+    chunks = []
+    i = 0
+    n = len(text)
+    while i < n:
+        end = min(i + max_chars, n)
+        chunks.append(text[i:end])
+        i = end - overlap
+        if i < 0:
+            i = 0
+    return [c.strip() for c in chunks if c.strip()]
+
+def get_current_user(request: Request) -> dict:
+    auth = request.headers.get("Authorization")
+    if not auth or not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="缺少授权")
+    token = auth.split(" ", 1)[1]
+    payload = decode_access_token(token)
+    email = payload.get("sub")
+    users = load_users()
+    user = users.get(email)
+    if not user:
+        raise HTTPException(status_code=401, detail="用户不存在")
+    return user
+
+def _now_ts() -> int:
+    return int(time.time())
+
+def _gen_code() -> str:
+    return f"{int(time.time() % 1000000):06d}" if os.environ.get("DEV_STABLE_CODE") == "1" else f"{int.from_bytes(os.urandom(3), 'big') % 1000000:06d}"
+
+CODE_TTL_SECONDS = int(os.environ.get("CODE_TTL_SECONDS", "600"))
+CODE_RATE_LIMIT_SECONDS = int(os.environ.get("CODE_RATE_LIMIT_SECONDS", "60"))
+
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER or "")
+SMTP_TLS = os.environ.get("SMTP_TLS", "true").lower() in {"1", "true", "yes"}
+
+def _send_code_email(to_email: str, code: str):
+    if not SMTP_HOST or not SMTP_FROM:
+        print(f"[DEV] 验证码发送到 {to_email}: {code}")
+        return
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.header import Header
+    subject = "您的注册验证码"
+    body = f"您正在注册 AI 阅读助手，验证码：{code}，{CODE_TTL_SECONDS//60} 分钟内有效。"
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = Header(subject, "utf-8")
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+    if SMTP_TLS:
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        server.starttls()
+    else:
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+    if SMTP_USER and SMTP_PASS:
+        server.login(SMTP_USER, SMTP_PASS)
+    server.sendmail(SMTP_FROM, [to_email], msg.as_string())
+    server.quit()
+
+@app.post("/auth/register")
+def register(body: RegisterBody):
+    users = load_users()
+    email = body.email.lower()
+    if email in users:
+        raise HTTPException(status_code=400, detail="该邮箱已注册")
+    if len(body.password) < 6:
+        raise HTTPException(status_code=400, detail="密码至少 6 位")
+    codes = load_codes()
+    entry = codes.get(email)
+    if not entry:
+        raise HTTPException(status_code=400, detail="请先获取验证码")
+    if entry.get("expires", 0) < _now_ts():
+        raise HTTPException(status_code=400, detail="验证码已过期")
+    if not bcrypt.verify(body.code, entry.get("hash", "")):
+        raise HTTPException(status_code=400, detail="验证码错误")
+    hashed = bcrypt.hash(body.password)
+    user = {
+        "id": str(int(time.time() * 1000)),
+        "name": body.name or email.split("@")[0],
+        "email": email,
+        "avatarUrl": "",
+        "passwordHash": hashed,
+        "createdAt": int(time.time()),
+    }
+    users[email] = user
+    save_users(users)
+    codes.pop(email, None)
+    save_codes(codes)
+    access = create_access_token(email)
+    refresh = create_refresh_token(email)
+    return {
+        "accessToken": access,
+        "refreshToken": refresh,
+        "user": {k: v for k, v in user.items() if k != "passwordHash"},
+    }
+
+@app.post("/auth/login")
+def login(body: LoginBody):
+    users = load_users()
+    email = body.email.lower()
+    user = users.get(email)
+    if not user:
+        raise HTTPException(status_code=401, detail="邮箱或密码错误")
+    if not bcrypt.verify(body.password, user.get("passwordHash", "")):
+        raise HTTPException(status_code=401, detail="邮箱或密码错误")
+    access = create_access_token(email)
+    refresh = create_refresh_token(email)
+    return {
+        "accessToken": access,
+        "refreshToken": refresh,
+        "user": {k: v for k, v in user.items() if k != "passwordHash"},
+    }
+
+@app.get("/auth/me")
+def me(current_user: dict = Depends(get_current_user)):
+    return {k: v for k, v in current_user.items() if k != "passwordHash"}
+
+@app.post("/auth/logout")
+def logout():
+    return {"ok": True}
+
+@app.post("/auth/refresh")
+def refresh(request: Request):
+    auth = request.headers.get("Authorization")
+    if not auth or not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="缺少授权")
+    token = auth.split(" ", 1)[1]
+    payload = decode_refresh_token(token)
+    email = payload.get("sub")
+    users = load_users()
+    if email not in users:
+        raise HTTPException(status_code=401, detail="用户不存在")
+    access = create_access_token(email)
+    return {"accessToken": access}
+
+@app.post("/auth/request-code")
+def request_code(body: LoginBody):
+    email = body.email.lower()
+    now = _now_ts()
+    codes = load_codes()
+    entry = codes.get(email)
+    if entry and now - int(entry.get("sentAt", 0)) < CODE_RATE_LIMIT_SECONDS:
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+    code = _gen_code()
+    codes[email] = {
+        "hash": bcrypt.hash(code),
+        "sentAt": now,
+        "expires": now + CODE_TTL_SECONDS,
+    }
+    save_codes(codes)
+    try:
+        _send_code_email(email, code)
+    except Exception:
+        print(f"[WARN] 邮件发送失败，但验证码已生成：{email} -> {code}")
+    if not SMTP_HOST or not SMTP_FROM:
+        return {"ok": True, "devCode": code}
+    return {"ok": True}
+
+@app.get("/storage/presign/get")
+def storage_presign_get(key: str, current_user: dict = Depends(get_current_user)):
+    try:
+        url = _presign_get_url(key)
+        return {"url": url}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"生成下载链接失败: {e}")
+
+@app.post("/storage/presign/put")
+def storage_presign_put(body: PresignPutBody, current_user: dict = Depends(get_current_user)):
+    try:
+        url, headers = _presign_put_url(body.key, body.contentType or "application/octet-stream")
+        return {"url": url, "headers": headers}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"生成上传链接失败: {e}")
+
+@app.post("/ai/ingest")
+def ai_ingest(body: AIIngestBody, current_user: dict = Depends(get_current_user)):
+    key = f"books/{body.bookId}.{body.fileType.lower()}"
+    try:
+        file_bytes = _storage_download(key)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"下载原书失败: {e}")
+
+    text = _extract_text(file_bytes, body.fileType)
+    if not text:
+        raise HTTPException(status_code=400, detail="暂不支持该格式或文本为空")
+
+    chunks = _chunk_text(text)
+    lines = []
+    for idx, c in enumerate(chunks):
+        lines.append(json.dumps({"i": idx, "t": c}, ensure_ascii=False))
+    data = ("\n".join(lines)).encode("utf-8")
+
+    try:
+        _storage_upload(f"books/{body.bookId}/chunks.jsonl", data, content_type="application/jsonl")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"上传分块失败: {e}")
+
+    summary = "".join(chunks[:3])
+    summary = (summary[:1500] + "...") if len(summary) > 1500 else summary
+    try:
+        _storage_upload(
+            f"books/{body.bookId}/summaries.json",
+            json.dumps({"preview": summary}, ensure_ascii=False).encode("utf-8"),
+            content_type="application/json",
+        )
+    except Exception:
+        pass
+
+    return {"ok": True, "chunks": len(chunks)}
+
+def _select_context(question: str, chunks: list, k: int = 4) -> list:
+    q_terms = [t for t in re.split(r"\s+", question) if t]
+    scored = []
+    for idx, c in enumerate(chunks):
+        score = 0
+        for t in q_terms:
+            score += c.count(t)
+        scored.append((score, idx, c))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [c for _, _, c in scored[:k] if _ > 0] or chunks[:min(k, len(chunks))]
+
+def _glm_chat(messages: list, use_pro: bool = False) -> str:
+    if LLM_PROVIDER != "zhipu" or not GLM_API_KEY:
+        return "后端未配置云模型，返回占位答案。建议设置 GLM_API_KEY。"
+    model = LLM_MODEL_PRO if use_pro else LLM_MODEL_FAST
+    url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "max_tokens": LLM_MAX_OUTPUT_TOKENS,
+        "stream": False,
+    }
+    req = urlrequest.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GLM_API_KEY}",
+        },
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+            return content or "(空响应)"
+    except Exception as e:
+        return f"云模型调用失败: {e}"
+
+def _openai_chat(messages: list, use_pro: bool = False) -> str:
+    if LLM_PROVIDER != "openai" or not OPENAI_API_KEY:
+        return "后端未配置 OpenAI，返回占位答案。请设置 OPENAI_API_KEY。"
+    model = LLM_MODEL_PRO if use_pro else LLM_MODEL_FAST
+    url = "https://api.openai.com/v1/chat/completions"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "max_tokens": LLM_MAX_OUTPUT_TOKENS,
+        "stream": False,
+    }
+    req = urlrequest.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+        },
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+            return content or "(空响应)"
+    except Exception as e:
+        return f"OpenAI 调用失败: {e}"
+
+def _chat(messages: list, use_pro: bool = False) -> str:
+    if LLM_PROVIDER == "openai":
+        return _openai_chat(messages, use_pro)
+    if LLM_PROVIDER == "zhipu":
+        return _glm_chat(messages, use_pro)
+    return "未支持的提供商，请设置 LLM_PROVIDER 为 'zhipu' 或 'openai'。"
+
+@app.post("/ai/query")
+def ai_query(body: AIQueryBody, current_user: dict = Depends(get_current_user)):
+    try:
+        chunks_data = _storage_download(f"books/{body.bookId}/chunks.jsonl").decode("utf-8", errors="ignore")
+    except Exception:
+        raise HTTPException(status_code=404, detail="未找到分块，请先执行 /ai/ingest")
+    chunks = []
+    for line in chunks_data.splitlines():
+        try:
+            obj = json.loads(line)
+            chunks.append(obj.get("t", ""))
+        except Exception:
+            continue
+    if not chunks:
+        raise HTTPException(status_code=400, detail="分块为空")
+
+    if body.companionMode and body.position and body.position > 0:
+        ratio = max(0.1, min(0.9, body.position / 100000.0))
+        cut = max(1, int(len(chunks) * ratio))
+        chunks = chunks[:cut]
+
+    ctx = _select_context(body.question, chunks, k=4)
+    joined = "\n\n".join([f"片段{idx+1}: {c[:800]}" for idx, c in enumerate(ctx)])
+    system_prompt = (
+        "你是一本中文书籍的AI阅读助手。依据提供的片段回答用户问题，"
+        "请尽量引用原文句子并标注出处（片段编号即可），避免臆造。如证据不足请如实说明。"
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"问题：{body.question}\n\n参考片段（最多4段）：\n{joined}"},
+    ]
+    use_pro = len(joined) < 400
+    content = _chat(messages, use_pro=use_pro)
+    return {"answer": content}
+
+@app.post("/auth/login-code")
+def login_code(body: LoginCodeBody):
+    email = body.email.lower()
+    codes = load_codes()
+    entry = codes.get(email)
+    if not entry:
+        raise HTTPException(status_code=400, detail="请先获取验证码")
+    if entry.get("expires", 0) < _now_ts():
+        raise HTTPException(status_code=400, detail="验证码已过期")
+    if not bcrypt.verify(body.code, entry.get("hash", "")):
+        raise HTTPException(status_code=400, detail="验证码错误")
+    users = load_users()
+    user = users.get(email)
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在，请先注册")
+    codes.pop(email, None)
+    save_codes(codes)
+    access = create_access_token(email)
+    refresh = create_refresh_token(email)
+    return {
+        "accessToken": access,
+        "refreshToken": refresh,
+        "user": {k: v for k, v in user.items() if k != "passwordHash"},
+    }
+
+# AI路由注册
+app.include_router(ai_router, prefix="/ai", tags=["AI"])
+
+if __name__ == "__main__":
+    import uvicorn
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8000"))
+    reload_flag = os.environ.get("RELOAD", "true").lower() in {"1", "true", "yes"}
+    uvicorn.run("main:app", host=host, port=port, reload=reload_flag)

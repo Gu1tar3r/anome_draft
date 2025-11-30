@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+passlib[bcrypt]
+PyJWT
+email-validator
+bcrypt==3.2.0
+minio
+python-dotenv
+cos-python-sdk-v5
+requests
+faiss-cpu
+numpy
+boto3>=1.26.0
+minio>=7.0.0
+python-dotenv>=0.19.0
+numpy>=1.21.0
